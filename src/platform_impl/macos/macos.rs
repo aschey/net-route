@@ -1,6 +1,7 @@
 use std::{
     ffi::CString,
     io::{self, ErrorKind},
+    mem::MaybeUninit,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     os::unix::prelude::FromRawFd,
 };
@@ -8,10 +9,10 @@ use std::{
 use async_stream::stream;
 use tokio::{
     fs::File,
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{unix::AsyncFd, AsyncReadExt, AsyncWriteExt},
     sync::broadcast,
-    task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::platform_impl::macos::bind::*;
 use crate::{Route, RouteChange};
@@ -28,7 +29,7 @@ pub fn ifname_to_index(name: &str) -> Option<u32> {
 
 pub(crate) struct Handle {
     tx: broadcast::Sender<RouteChange>,
-    listen_handle: JoinHandle<()>,
+    cancellation_token: CancellationToken,
 }
 
 impl Handle {
@@ -40,11 +41,21 @@ impl Handle {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        let route_fd = unsafe { File::from_raw_fd(fd) };
+        let socket = unsafe { socket2::Socket::from_raw_fd(fd) };
 
-        let listen_handle = tokio::spawn(Self::listen(tx.clone(), route_fd));
+        let route_fd = AsyncFd::new(socket).unwrap();
 
-        Ok(Self { tx, listen_handle })
+        let cancellation_token = CancellationToken::new();
+        tokio::spawn(Self::listen(
+            tx.clone(),
+            route_fd,
+            cancellation_token.clone(),
+        ));
+
+        Ok(Self {
+            tx,
+            cancellation_token,
+        })
     }
 
     pub(crate) async fn default_route(&self) -> io::Result<Option<Route>> {
@@ -95,11 +106,27 @@ impl Handle {
         list_routes().await
     }
 
-    async fn listen(tx: broadcast::Sender<RouteChange>, mut sock: File) {
-        let mut buf = [0u8; 2048];
+    async fn listen(
+        tx: broadcast::Sender<RouteChange>,
+        sock: AsyncFd<socket2::Socket>,
+        cancellation_token: CancellationToken,
+    ) {
+        let mut buf = [MaybeUninit::new(0u8); 2048];
+
         loop {
-            // TODO: should probably use this
-            let _read = sock.read(&mut buf).await.expect("sock read err");
+            let mut guard = tokio::select! {
+                guard = sock.readable() => {
+                    guard.expect("IO error")
+                }
+                _ = cancellation_token.cancelled() => {
+                    return;
+                }
+            };
+            let _read = guard
+                .try_io(|inner| inner.get_ref().recv(&mut buf))
+                .expect("IO error")
+                .expect("recv error");
+
             let hdr: &rt_msghdr;
             let route = unsafe {
                 hdr = std::mem::transmute(buf.as_mut_ptr());
@@ -121,7 +148,7 @@ impl Handle {
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        self.listen_handle.abort();
+        self.cancellation_token.cancel();
     }
 }
 
