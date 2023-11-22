@@ -42,6 +42,9 @@ impl Handle {
             return Err(io::Error::last_os_error());
         }
         let socket = unsafe { socket2::Socket::from_raw_fd(fd) };
+        socket
+            .set_nonblocking(true)
+            .expect("failed to set nonblocking");
 
         let route_fd = AsyncFd::new(socket).unwrap();
 
@@ -122,10 +125,12 @@ impl Handle {
                     return;
                 }
             };
-            let _read = guard
+            if guard
                 .try_io(|inner| inner.get_ref().recv(&mut buf))
-                .expect("IO error")
-                .expect("recv error");
+                .is_err()
+            {
+                continue;
+            }
 
             let hdr: &rt_msghdr;
             let route = unsafe {
